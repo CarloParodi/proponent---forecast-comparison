@@ -1,0 +1,48 @@
+create table streamlit_utilities.ors_forecast as
+with master_data as (
+	select distinct "SKU ID", "FAMILY" 
+	from ui.v_product_data vpd 
+),
+blind_fcst as (
+	select 
+	unique_id, 
+	ds as "week",
+	pred_ensemble as "ORS prediction"
+	from result_algo.res_blind_results rbr 
+	where rbr.run_id = '2025_12_29_sqrt_transform_rmse_loss_all_skus'
+	and ds != '2025-11-22 00:00:00.000'
+)
+select distinct
+md."FAMILY",
+bf.unique_id as "SKU ID",
+bf."week",
+bf."ORS prediction"
+from blind_fcst bf
+left join master_data md
+on bf.unique_id = md."SKU ID"
+
+-------------------------------------------------------------------------------------------------
+------------------------------------ Creazione tabella demand -----------------------------------
+-------------------------------------------------------------------------------------------------
+
+CREATE TABLE streamlit_utilities.sku_week_demand (
+   "SKU ID" VARCHAR,
+   "Week" TIMESTAMP,
+   "Demand" decimal
+)
+
+ALTER TABLE streamlit_utilities.sku_week_demand
+ADD CONSTRAINT sku_week_demand_pk PRIMARY KEY ("SKU ID","Week");
+
+-------------------------------------------------------------------------------------------------
+------------------------------- Creazione tabella current forecast ------------------------------
+-------------------------------------------------------------------------------------------------
+create table streamlit_utilities.current_forecast (
+   "SKU ID" VARCHAR,
+   "Week" TIMESTAMP,
+   "Current Forecast" decimal,
+   "Date update" TIMESTAMP
+)
+
+ALTER TABLE streamlit_utilities.current_forecast
+ADD CONSTRAINT current_forecast_pk PRIMARY KEY ("SKU ID","Week","Date update");
