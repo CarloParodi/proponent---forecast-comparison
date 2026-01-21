@@ -405,7 +405,32 @@ df_cf, cf_ts = load_current_forecast_latest_from_db()
 c1, c2, c3 = st.columns(3)
 c1.metric("Reference rows (ors_forecast)", f"{len(df_ref):,}")
 c2.metric("Demand rows (DB)", f"{len(df_demand):,}")
-c3.metric("Current Forecast snapshot", "None" if cf_ts is None else str(cf_ts))
+with c3:
+    ts = st.session_state.get("current_fcst_snapshot_ts")
+    ts = pd.to_datetime(ts, errors="coerce") if ts is not None else None
+
+    if ts is None or pd.isna(ts):
+        date_str = "—"
+        time_str = ""
+    else:
+        date_str = ts.strftime("%m/%d/%Y")   # US format
+        time_str = ts.strftime("%H:%M")      # hour:minute (no ms)
+
+    st.markdown(
+        f"""
+        <div style="padding:0.15rem 0;">
+          <div style="font-size:0.85rem; opacity:0.65; margin-bottom:0.15rem;">
+            Current Forecast snapshot
+          </div>
+          <div style="font-size:1.55rem; font-weight:650; line-height:1.1;">
+            {date_str}
+          </div>
+          {"<div style='font-size:0.9rem; opacity:0.65; margin-top:0.2rem;'>" + time_str + "</div>" if time_str else ""}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 if df_ref.empty:
     st.warning("Reference table is empty. Nothing to compare yet.")

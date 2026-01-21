@@ -159,40 +159,47 @@ def _parse_numeric(series: pd.Series) -> pd.Series:
 
 
 # ---------------- Validation ----------------
-def validate_current_forecast_csv(df_csv: pd.DataFrame, df_ref: pd.DataFrame):
-    required_cols = ["SKU ID", "Week", "Current Forecast"]
-    missing_cols = [c for c in required_cols if c not in df_csv.columns]
-    if missing_cols:
-        return {"ok": False, "error": f"Missing required columns: {missing_cols}. Expected: {required_cols}"}
+def validate_current_forecast_df(df_cf: pd.DataFrame, df_ref: pd.DataFrame):
+    # Se non c’è nulla su DB
+    if df_cf is None or df_cf.empty:
+        ref_skus = set(df_ref["SKU ID"])
+        return {
+            "ok": True,
+            "invalid_week_rows": 0,
+            "invalid_value_rows": 0,
+            "duplicate_key_rows": 0,
+            "missing_skus": sorted(ref_skus),
+            "missing_pairs": [],
+            "extra_pairs": [],
+        }
 
-    df = df_csv.copy()
+    df = df_cf.copy()
     df["SKU ID"] = df["SKU ID"].astype(str).str.strip()
     df["Week"] = pd.to_datetime(df["Week"], errors="coerce").dt.date
-    df["Current Forecast"] = _parse_numeric(df["Current Forecast"])
+    df["Current Forecast"] = pd.to_numeric(df["Current Forecast"], errors="coerce")
 
     invalid_week = int(df["Week"].isna().sum())
     invalid_val = int(df["Current Forecast"].isna().sum())
     dup_count = int(df.duplicated(subset=["SKU ID", "Week"]).sum())
 
     ref_skus = set(df_ref["SKU ID"])
-    csv_skus = set(df["SKU ID"])
+    cf_skus = set(df["SKU ID"])
 
-    missing_skus = sorted(ref_skus - csv_skus)
+    missing_skus = sorted(ref_skus - cf_skus)
 
     ref_keys = set(zip(df_ref["SKU ID"], df_ref["Week"]))
-    csv_keys = set(zip(df["SKU ID"], df["Week"]))
+    cf_keys = set(zip(df["SKU ID"], df["Week"]))
 
-    # missing weeks only for SKUs present in CSV
-    common_skus = ref_skus & csv_skus
+    # missing weeks solo per SKUs presenti nel CF (evita ridondanza)
+    common_skus = ref_skus & cf_skus
     df_ref_common = df_ref[df_ref["SKU ID"].isin(common_skus)]
     ref_keys_common = set(zip(df_ref_common["SKU ID"], df_ref_common["Week"]))
 
-    missing_pairs = sorted(ref_keys_common - csv_keys)
-    extra_pairs = sorted(csv_keys - ref_keys)
+    missing_pairs = sorted(ref_keys_common - cf_keys)
+    extra_pairs = sorted(cf_keys - ref_keys)
 
     return {
         "ok": True,
-        "df_parsed": df[["SKU ID", "Week", "Current Forecast"]],
         "invalid_week_rows": invalid_week,
         "invalid_value_rows": invalid_val,
         "duplicate_key_rows": dup_count,
@@ -419,62 +426,6 @@ def load_current_forecast_latest_from_db() -> tuple[pd.DataFrame, datetime | Non
 
     return df, latest_ts
 
-
-def persist_current_forecast_snapshot(engine, cf_df: pd.DataFrame) -> tuple[bool, str, datetime | None]:
-    """
-    Inserisce uno snapshot: tutte le righe con lo stesso "Date update" = now.
-    Non sovrascrive snapshot vecchi: restano nello storico.
-    """
-    if cf_df is None or cf_df.empty:
-        return False, "No current forecast data to save (memory is empty).", None
-
-    from sqlalchemy import Table, Column, MetaData
-    from sqlalchemy.types import String, TIMESTAMP, Numeric
-
-    df = cf_df.copy()
-    df["SKU ID"] = df["SKU ID"].astype(str).str.strip()
-    # in memoria Week è date -> la salvo come datetime (00:00:00)
-    df["Week"] = pd.to_datetime(df["Week"], errors="coerce")
-    df["Current Forecast"] = pd.to_numeric(df["Current Forecast"], errors="coerce")
-    df = df.dropna(subset=["SKU ID", "Week", "Current Forecast"])
-    df = df.groupby(["SKU ID", "Week"], as_index=False)["Current Forecast"].mean()
-
-    if df.empty:
-        return False, "Current forecast dataframe is empty after cleaning.", None
-
-    # timestamp snapshot (naive). Se preferisci locale: datetime.now()
-    snapshot_ts = datetime.utcnow()
-
-    md = MetaData()
-    t = Table(
-        "current_forecast",
-        md,
-        Column("SKU ID", String),
-        Column("Week", TIMESTAMP),
-        Column("Current Forecast", Numeric),
-        Column("Date update", TIMESTAMP),
-        schema="streamlit_forecast_comparison",
-    )
-
-    rows = [
-        {
-            "SKU ID": r["SKU ID"],
-            "Week": r["Week"].to_pydatetime(),
-            "Current Forecast": float(r["Current Forecast"]),
-            "Date update": snapshot_ts,
-        }
-        for _, r in df.iterrows()
-    ]
-
-    with engine.begin() as conn:
-        conn.execute(t.insert(), rows)
-
-    # per vedere subito lo snapshot appena salvato
-    load_current_forecast_latest_from_db.clear()
-
-    return True, f"Saved snapshot with {len(rows):,} rows. Date update = {snapshot_ts}.", snapshot_ts
-
-
 # ---------------- Styling ----------------
 def style_missing_cols(df: pd.DataFrame, has_csv_cf: bool, has_demand: bool):
     def hl_missing(v):
@@ -489,7 +440,6 @@ def style_missing_cols(df: pd.DataFrame, has_csv_cf: bool, has_demand: bool):
     if has_demand:
         sty = sty.applymap(hl_missing_demand, subset=["Demand"])
     return sty
-
 
 # ---------------- SESSION INIT ----------------
 if "show_only_problems" not in st.session_state:
@@ -513,9 +463,6 @@ if "current_fcst_loaded_from_db" not in st.session_state:
 if "current_fcst_snapshot_ts" not in st.session_state:
     st.session_state["current_fcst_snapshot_ts"] = None
 
-if "cf_dirty" not in st.session_state:
-    st.session_state["cf_dirty"] = False
-
 if "demand_dirty" not in st.session_state:
     st.session_state["demand_dirty"] = False
 
@@ -523,7 +470,6 @@ if "demand_dirty" not in st.session_state:
 def has_nonempty_df(name: str) -> bool:
     df = st.session_state.get(name)
     return df is not None and hasattr(df, "empty") and (not df.empty)
-
 
 # ---------------- UI ----------------
 
@@ -536,15 +482,6 @@ st.title("Forecast Table")
 
 with st.sidebar:
     st.header("Uploads")
-
-    st.subheader("Current Forecast")
-    uploaded_cf = st.file_uploader(
-        "Upload CSV",
-        type=["csv"],
-        accept_multiple_files=False,
-        help="Required columns: SKU ID, Week, Current Forecast",
-        key="uploader_cf",
-    )
 
     st.subheader("Demand (incremental)")
     uploaded_demand = st.file_uploader(
@@ -584,36 +521,13 @@ try:
         st.session_state["current_fcst_df"] = db_cf
         st.session_state["current_fcst_snapshot_ts"] = db_ts
         st.session_state["current_fcst_loaded_from_db"] = True
-        st.session_state["cf_dirty"] = False
 
+    st.session_state["val_cf"] = validate_current_forecast_df(
+        st.session_state.get("current_fcst_df"),
+        df_ref
+    )
 
     # --- Handle uploads (store in session_state) ---
-    if uploaded_cf is not None:
-        try:
-            df_csv = _read_csv(uploaded_cf)
-        except Exception as e:
-            reject_upload(
-                "Current Forecast CSV could not be read",
-                f"Parsing error: {e}"
-            )
-        else:
-            res = validate_current_forecast_csv(df_csv, df_ref)
-            st.session_state["val_cf"] = res
-            st.session_state["current_fcst_snapshot_ts"] = None
-
-            if not res.get("ok", False):
-                reject_upload(
-                    "Invalid Current Forecast CSV format",
-                    res.get("error", "Unknown validation error.")
-                )
-            else:
-                st.session_state["current_fcst_df"] = upsert_kv(
-                    st.session_state.get("current_fcst_df"),
-                    res["df_parsed"],
-                    key_cols=["SKU ID", "Week"],
-                    value_col="Current Forecast",
-                )
-                st.session_state["cf_dirty"] = True
 
     if uploaded_demand is not None:
         try:
@@ -646,16 +560,7 @@ try:
     with persist_box:
         st.header("Persist")
 
-        can_save_cf = has_nonempty_df("current_fcst_df") and st.session_state.get("cf_dirty", False)
         can_save_demand = has_nonempty_df("demand_df") and st.session_state.get("demand_dirty", False)
-
-        save_current_fcst = st.button(
-            "Save Current Forecast to DB",
-            use_container_width=True,
-            disabled=not can_save_cf,
-            help=None if can_save_cf else "Upload a Current Forecast CSV to enable saving.",
-            key="btn_save_cf",
-        )
 
         save_demand = st.button(
             "Save Demand to DB",
@@ -664,29 +569,6 @@ try:
             help=None if can_save_demand else "Upload a Demand CSV to enable saving.",
             key="btn_save_demand",
         )
-
-    # --- Persist current forecast snapshot ---
-    if save_current_fcst:
-        cf_df = st.session_state.get("current_fcst_df")
-        if cf_df is None or cf_df.empty:
-            st.warning("No Current Forecast data in memory. Upload a CSV first.")
-        else:
-            try:
-                engine = _get_engine()
-                ok, msg, ts = persist_current_forecast_snapshot(engine, cf_df)
-                (st.success if ok else st.warning)(msg)
-                if ok:
-                    st.session_state["cf_dirty"] = False
-                    # mostra subito lo snapshot appena salvato
-                    st.session_state["current_fcst_snapshot_ts"] = ts
-
-                    # prova a ricaricare dal DB, ma SOLO se torna non-vuoto
-                    db_cf, db_ts = load_current_forecast_latest_from_db()
-                    if db_cf is not None and not db_cf.empty:
-                        st.session_state["current_fcst_df"] = db_cf
-                        st.session_state["current_fcst_snapshot_ts"] = db_ts
-            except Exception as e:
-                st.error("Failed to save Current Forecast to DB.")
 
     # --- Persist demand ---
     if save_demand:
@@ -812,7 +694,7 @@ try:
 
     # Current Forecast validation
     if st.session_state.get("val_cf") is None:
-        st.info("No Current Forecast CSV uploaded yet.")
+        st.info("Current Forecast: not loaded yet.")
     else:
         v = st.session_state["val_cf"]
         if not v.get("ok", False):
