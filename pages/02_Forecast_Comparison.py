@@ -159,6 +159,34 @@ def load_current_forecast_latest_from_db() -> tuple[pd.DataFrame, datetime | Non
 
 
 # ---------------- Metrics ----------------
+def round_half_up_to_int(series: pd.Series) -> pd.Series:
+    x = pd.to_numeric(series, errors="coerce")
+    # round half-up (0.5 -> 1). Gestisce anche eventuali negativi.
+    return np.sign(x) * np.floor(np.abs(x) + 0.5)
+
+def compute_ape_series(demand: pd.Series, forecast: pd.Series) -> pd.Series:
+    """
+    APE (%) with special rule:
+      - if Demand != 0: |F-A| / |A| * 100
+      - if Demand == 0: |F-A| / |F| * 100  -> 100% if F!=0
+        (and 0% if both Demand==0 and Forecast==0)
+    """
+    d = pd.to_numeric(demand, errors="coerce")
+    f = round_half_up_to_int(forecast)
+
+    out = pd.Series(np.nan, index=d.index, dtype="float64")
+
+    # Case 1: Demand != 0
+    m1 = d.notna() & f.notna() & (d != 0)
+    out.loc[m1] = (f.loc[m1] - d.loc[m1]).abs() / d.loc[m1].abs() * 100.0
+
+    # Case 2: Demand == 0
+    m0 = d.notna() & f.notna() & (d == 0)
+    # If forecast != 0 => 100%, else (forecast==0) => 0%
+    out.loc[m0] = np.where(f.loc[m0] != 0, 100.0, 0.0)
+
+    return out
+
 def compute_week_ahead_table(df_ref: pd.DataFrame,
                             df_demand: pd.DataFrame,
                             df_cf: pd.DataFrame,
@@ -184,20 +212,10 @@ def compute_week_ahead_table(df_ref: pd.DataFrame,
 
     base = base[(base["Week Ahead"] >= 1) & (base["Week Ahead"] <= horizon)].copy()
 
-    # APE: abs(forecast - demand) / abs(demand) * 100
-    # Demand==0 -> NaN (APE non definito)
     demand = pd.to_numeric(base["Demand"], errors="coerce")
-    valid_demand = demand.notna() & (demand != 0)
 
-    base["APE (Current)"] = pd.NA
-    base["APE (Deda)"] = pd.NA
-
-    base.loc[valid_demand, "APE (Current)"] = (
-        (base.loc[valid_demand, "Current Forecast"] - demand[valid_demand]).abs() / demand[valid_demand].abs() * 100
-    )
-    base.loc[valid_demand, "APE (Deda)"] = (
-        (base.loc[valid_demand, "Deda Forecast"] - demand[valid_demand]).abs() / demand[valid_demand].abs() * 100
-    )
+    base["APE (Current)"] = compute_ape_series(demand, base["Current Forecast"])
+    base["APE (Deda)"] = compute_ape_series(demand, base["Deda Forecast"])
 
     # aggregations per week-ahead
     def _std(s: pd.Series):
@@ -248,7 +266,6 @@ def build_base_for_metrics(df_ref: pd.DataFrame,
     Unisce ref + demand + current forecast e calcola:
     - Week Ahead (1..horizon)
     - APE (Current) e APE (Deda)
-    Usa solo Demand != 0 per le APE.
     """
     if df_ref.empty:
         return pd.DataFrame()
@@ -268,19 +285,9 @@ def build_base_for_metrics(df_ref: pd.DataFrame,
     base = base[(base["Week Ahead"] >= 1) & (base["Week Ahead"] <= horizon)].copy()
 
     demand = pd.to_numeric(base["Demand"], errors="coerce")
-    valid_demand = demand.notna() & (demand != 0)
 
-    base["APE (Current)"] = pd.NA
-    base["APE (Deda)"] = pd.NA
-
-    base.loc[valid_demand, "APE (Current)"] = (
-        (pd.to_numeric(base.loc[valid_demand, "Current Forecast"], errors="coerce") - demand[valid_demand]).abs()
-        / demand[valid_demand].abs() * 100
-    )
-    base.loc[valid_demand, "APE (Deda)"] = (
-        (pd.to_numeric(base.loc[valid_demand, "Deda Forecast"], errors="coerce") - demand[valid_demand]).abs()
-        / demand[valid_demand].abs() * 100
-    )
+    base["APE (Current)"] = compute_ape_series(demand, base["Current Forecast"])
+    base["APE (Deda)"] = compute_ape_series(demand, base["Deda Forecast"])
 
     return base
 
@@ -295,23 +302,19 @@ def compute_global_stats(base: pd.DataFrame) -> pd.DataFrame:
     if base is None or base.empty:
         return pd.DataFrame(columns=cols)
 
-    demand = pd.to_numeric(base["Demand"], errors="coerce")
-    valid_demand = demand.notna() & (demand != 0)
+    ape_c = pd.to_numeric(base.get("APE (Current)"), errors="coerce")
+    ape_d = pd.to_numeric(base.get("APE (Deda)"), errors="coerce")
 
-    ape_c = pd.to_numeric(base.loc[valid_demand, "APE (Current)"], errors="coerce")
-    ape_d = pd.to_numeric(base.loc[valid_demand, "APE (Deda)"], errors="coerce")
-
-    def _std_nontrivial(s: pd.Series):
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        return s.std() if len(s) >= 2 else pd.NA
+    valid_obs = ape_c.notna() | ape_d.notna()
 
     row = {
-        "Observations (with valid demand)": int(valid_demand.sum()),
+        "Observations (with valid demand)": int(valid_obs.sum()),
         "APE (Current)": ape_c.mean(),
         "Std Dev APE (Current)": _std_nontrivial(ape_c),
         "APE (Deda)": ape_d.mean(),
         "Std Dev APE (Deda)": _std_nontrivial(ape_d),
     }
+
     return pd.DataFrame([row])
 
 def compute_family_stats(base: pd.DataFrame) -> pd.DataFrame:
@@ -329,16 +332,11 @@ def compute_family_stats(base: pd.DataFrame) -> pd.DataFrame:
 
     tmp = base.copy()
 
-    demand = pd.to_numeric(tmp["Demand"], errors="coerce")
-    valid = demand.notna() & (demand != 0)
+    ape_c = pd.to_numeric(tmp.get("APE (Current)"), errors="coerce")
+    ape_d = pd.to_numeric(tmp.get("APE (Deda)"), errors="coerce")
 
-    tmp["APE (Current)"] = pd.to_numeric(tmp["APE (Current)"], errors="coerce")
-    tmp["APE (Deda)"] = pd.to_numeric(tmp["APE (Deda)"], errors="coerce")
-
-    # APE vale solo dove demand è valida
-    tmp.loc[~valid, "APE (Current)"] = pd.NA
-    tmp.loc[~valid, "APE (Deda)"] = pd.NA
-    tmp["_obs"] = valid.astype(int)
+    valid_obs = ape_c.notna() | ape_d.notna()
+    tmp["_obs"] = valid_obs.astype(int)
 
     agg = (
         tmp.groupby("FAMILY", dropna=False)
@@ -367,16 +365,13 @@ def build_ape_long(base: pd.DataFrame) -> pd.DataFrame:
     Ritorna un DF lungo con colonne:
       - Model: "Current" | "Deda"
       - APE: valore APE (%)
-    Usa solo righe con Demand valida (notna e != 0).
+    Usa solo righe con Demand valida (notna).
     """
     if base is None or base.empty:
         return pd.DataFrame(columns=["Model", "APE"])
 
-    demand = pd.to_numeric(base.get("Demand"), errors="coerce")
-    valid = demand.notna() & (demand != 0)
-
-    ape_c = pd.to_numeric(base.loc[valid, "APE (Current)"], errors="coerce")
-    ape_d = pd.to_numeric(base.loc[valid, "APE (Deda)"], errors="coerce")
+    ape_c = pd.to_numeric(base.get("APE (Current)"), errors="coerce").dropna()
+    ape_d = pd.to_numeric(base.get("APE (Deda)"), errors="coerce").dropna()
 
     out = pd.concat(
         [
@@ -522,8 +517,8 @@ fmt = {
 sty = table.style.format(fmt, na_rep="")
 
 st.caption(
-    "Note: APE is computed only when Demand is available and Demand != 0. "
-    "Weeks without sufficient demand will show blank KPI values."
+    "Note: APE is computed when Demand is available. "
+    "If Demand=0, we use Forecast in the denominator (APE=100% unless Forecast=0 -> 0%)."
 )
 
 st.dataframe(sty, use_container_width=True, hide_index=True)
