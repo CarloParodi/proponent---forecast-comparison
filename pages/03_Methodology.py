@@ -11,14 +11,44 @@ st.caption("How to read APE-based metrics and why we segment results by horizon 
 # -----------------------------
 # Helpers (for the interactive example only)
 # -----------------------------
+def round_half_up_to_int(x: float) -> float:
+    """Round half-up to nearest integer (0.5 -> 1). Works also for negatives."""
+    if x is None:
+        return np.nan
+    x = pd.to_numeric(x, errors="coerce")
+    if pd.isna(x):
+        return np.nan
+    return float(np.sign(x) * np.floor(np.abs(x) + 0.5))
+
 def ape(actual: float, forecast: float) -> float:
-    """Absolute Percentage Error in %.
-    Returns NaN if actual is 0 or missing."""
+    """
+    Absolute Percentage Error (APE) in % - app variant.
+
+    We compute APE using a business rule for Actual=0:
+      - if Actual != 0: |F - A| / |A| * 100
+      - if Actual == 0 and F != 0: |F - A| / |F| * 100 -> 100%
+      - if Actual == 0 and F == 0: 0%
+
+    IMPORTANT: forecast is first rounded to the nearest integer (round half-up),
+    consistently with the app logic.
+    """
     if actual is None or forecast is None:
         return np.nan
-    if actual == 0:
+
+    a = pd.to_numeric(actual, errors="coerce")
+    f = round_half_up_to_int(forecast)
+
+    if pd.isna(a) or pd.isna(f):
         return np.nan
-    return abs(forecast - actual) / abs(actual) * 100.0
+
+    # Case 1: Actual != 0
+    if a != 0:
+        return abs(f - a) / abs(a) * 100.0
+
+    # Case 2: Actual == 0
+    if f == 0:
+        return 0.0
+    return abs(f - a) / abs(f) * 100.0  # = 100% when a==0 and f!=0
 
 
 # -----------------------------
@@ -34,20 +64,31 @@ with c1:
 
 It is computed for each observation (SKU, Week):
 
-- **Actual** = observed demand
-- **Forecast** = predicted demand
+- **Actual (A)** = observed demand
+- **Forecast (F)** = predicted demand (**rounded to the nearest integer** in this app)
 
 We use the absolute value, so APE is always non-negative.
 """
     )
-    st.latex(r"\mathrm{APE} = \frac{|Forecast - Actual|}{|Actual|} \times 100")
+
+    st.markdown("### Formula used in this app")
+    st.latex(r"""
+\mathrm{APE} =
+\begin{cases}
+\frac{|F - A|}{|A|} \times 100 & \text{if } A \neq 0 \\
+\frac{|F - A|}{|F|} \times 100 & \text{if } A = 0 \text{ and } F \neq 0 \\
+0 & \text{if } A = 0 \text{ and } F = 0
+\end{cases}
+""")
 
     st.markdown(
         """
-**Important edge case:** when **Actual = 0**, APE is undefined (division by zero).
-In practice you must either:
-- exclude those observations, or
-- use an alternative metric (e.g., sMAPE), depending on your business rules.
+**Why this rule?**  
+When **Actual = 0**, the “standard” APE would be undefined (division by zero).  
+Our rule makes the metric usable and consistent with the business meaning:
+
+- If demand is zero but forecast is positive → **APE = 100%** (full miss)
+- If both demand and forecast are zero → **APE = 0%** (perfect)
 """
     )
 
@@ -56,7 +97,10 @@ with c2:
         "Interpretation:\n\n"
         "- **APE = 0%** → perfect forecast\n"
         "- **APE = 10%** → forecast is off by 10% of actual demand\n"
-        "- **Lower is better** (on average)"
+        "- **Lower is better** (on average)\n\n"
+        "Special case:\n"
+        "- **Actual = 0, Forecast > 0 → APE = 100%**\n"
+        "- **Actual = 0, Forecast = 0 → APE = 0%**"
     )
 
 
@@ -92,6 +136,9 @@ st.header("3) Small example (interactive)")
 st.markdown(
     """
 Use this toy example to see how APE is computed and how mean/std behave.
+
+**Tip:** try setting Actual to **0** to see the special rule in action.
+Forecasts are rounded to the nearest integer before computing APE (e.g., 0.7 → 1, 0.3 → 0).
 """
 )
 
@@ -99,16 +146,21 @@ ex_c1, ex_c2, ex_c3 = st.columns(3)
 
 with ex_c1:
     a1 = st.number_input("Actual (SKU A)", min_value=0.0, value=100.0, step=1.0)
-    f1_deda = st.number_input("Deda Forecast (SKU A)", min_value=0.0, value=110.0, step=1.0)
-    f1_curr = st.number_input("Current Forecast (SKU A)", min_value=0.0, value=95.0, step=1.0)
+    f1_deda = st.number_input("Deda Forecast (SKU A)", min_value=0.0, value=110.0, step=0.1)
+    f1_curr = st.number_input("Current Forecast (SKU A)", min_value=0.0, value=95.0, step=0.1)
 
 with ex_c2:
     a2 = st.number_input("Actual (SKU B)", min_value=0.0, value=120.0, step=1.0)
-    f2_deda = st.number_input("Deda Forecast (SKU B)", min_value=0.0, value=90.0, step=1.0)
-    f2_curr = st.number_input("Current Forecast (SKU B)", min_value=0.0, value=130.0, step=1.0)
+    f2_deda = st.number_input("Deda Forecast (SKU B)", min_value=0.0, value=90.0, step=0.1)
+    f2_curr = st.number_input("Current Forecast (SKU B)", min_value=0.0, value=130.0, step=0.1)
 
 with ex_c3:
     st.write("")
+    st.caption("Forecast rounding (half-up):")
+    st.write(f"SKU A Deda → {round_half_up_to_int(f1_deda):.0f}")
+    st.write(f"SKU A Current → {round_half_up_to_int(f1_curr):.0f}")
+    st.write(f"SKU B Deda → {round_half_up_to_int(f2_deda):.0f}")
+    st.write(f"SKU B Current → {round_half_up_to_int(f2_curr):.0f}")
 
 # Compute example
 rows = []
@@ -122,6 +174,8 @@ for sku, act, fd, fc in [
             "Actual": act,
             "Deda Forecast": fd,
             "Current Forecast": fc,
+            "Deda Forecast (rounded)": round_half_up_to_int(fd),
+            "Current Forecast (rounded)": round_half_up_to_int(fc),
             "APE (Deda) %": ape(act, fd),
             "APE (Current) %": ape(act, fc),
         }
@@ -135,6 +189,8 @@ st.dataframe(
             "Actual": "{:.2f}",
             "Deda Forecast": "{:.2f}",
             "Current Forecast": "{:.2f}",
+            "Deda Forecast (rounded)": "{:.0f}",
+            "Current Forecast (rounded)": "{:.0f}",
             "APE (Deda) %": "{:.2f}",
             "APE (Current) %": "{:.2f}",
         },
@@ -216,7 +272,10 @@ st.header("5) Practical notes & caveats")
 st.markdown(
     """
 - **Missing demand** → you cannot compute APE; those rows are skipped.
-- **Actual = 0** → APE undefined; decide your rule (exclude or alternative metric).
+- **Actual = 0** → we apply the app rule:
+  - if **Forecast > 0** ⇒ **APE = 100%**
+  - if **Forecast = 0** ⇒ **APE = 0%**
+- **Forecasts are rounded** to the nearest integer (half-up) before computing APE.
 - **Outliers** can heavily impact averages; std dev helps you detect them.
 - **Mean APE** tells “how wrong on average”; **Std dev APE** tells “how stable / consistent the errors are.”
 """
