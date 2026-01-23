@@ -356,8 +356,10 @@ def compute_family_stats(base: pd.DataFrame) -> pd.DataFrame:
     fams = tmp[["FAMILY"]].drop_duplicates()
     out = fams.merge(agg, on="FAMILY", how="left")
     out["Observations (with valid demand)"] = out["Observations (with valid demand)"].fillna(0).astype(int)
+    out["APE (Current)"] = pd.to_numeric(out["APE (Current)"], errors="coerce")
 
-    return out.sort_values(["Observations (with valid demand)", "FAMILY"], ascending=[False, True])
+    return out.sort_values(["APE (Current)", "FAMILY"], ascending=[True, True], na_position="last")
+
 
 
 def build_ape_long(base: pd.DataFrame) -> pd.DataFrame:
@@ -388,6 +390,8 @@ def build_ape_long(base: pd.DataFrame) -> pd.DataFrame:
 # ---------------- UI ----------------
 st.title("Forecast Comparison")
 
+def height_no_scroll(n_rows: int, row_px: int = 32, header_px: int = 38, padding_px: int = 12) -> int:
+    return header_px + row_px * (max(1, n_rows) + 1) + padding_px
 
 try:
     df_ref = load_reference_table()
@@ -395,6 +399,8 @@ except (OperationalError, DBAPIError) as e:
     show_db_error_and_retry(e, key="reconnect_cmp")
 df_demand = load_demand_from_db()
 df_cf, cf_ts = load_current_forecast_latest_from_db()
+
+st.session_state["current_fcst_snapshot_ts"] = cf_ts
 
 # quick status
 c1, c2, c3 = st.columns(3)
@@ -520,8 +526,14 @@ st.caption(
     "Note: APE is computed when Demand is available. "
     "If Demand=0, we use Forecast in the denominator (APE=100% unless Forecast=0 -> 0%)."
 )
+table_disp = table.copy()
+if "Week" in table_disp.columns:
+    table_disp["Week"] = pd.to_datetime(table_disp["Week"], errors="coerce").dt.strftime("%m/%d/%Y")
 
-st.dataframe(sty, use_container_width=True, hide_index=True)
+sty = table_disp.style.format(fmt, na_rep="")
+
+h_week = height_no_scroll(len(table_disp))
+st.dataframe(sty, use_container_width=True, hide_index=True, height=h_week)
 
 # --- FAMILY TABLE ---
 st.subheader("APE by Family")
@@ -539,8 +551,12 @@ total_obs = int(family_tbl["Observations (with valid demand)"].sum()) if family_
 if total_obs == 0:
     st.info("No valid demand observations yet to compute family KPIs (Demand missing or Demand=0).")
 
+family_sty = family_tbl.style.format(family_fmt, na_rep="")
+
+h_fam = height_no_scroll(len(family_tbl))
 st.dataframe(
-    family_tbl.style.format(family_fmt, na_rep=""),
+    family_sty,
     use_container_width=True,
-    hide_index=True
+    hide_index=True,
+    height=h_fam,   # <-- niente max cap => niente scroll verticale
 )
